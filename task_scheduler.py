@@ -1,157 +1,67 @@
 #!/usr/bin/env python3
-"""Task scheduler — work-stealing, priority queues, and rate limiting.
+"""Task scheduler: cron parsing, DAG execution, retries, priorities."""
+import sys, time, re, heapq
+from collections import defaultdict
 
-One file. Zero deps. Does one thing well.
-
-Implements multiple scheduling strategies: FIFO, priority, round-robin,
-work-stealing (Cilk-style), and token bucket rate limiting.
-"""
-import time, sys, random, threading
-from collections import deque
-import heapq
+class CronExpr:
+    def __init__(self, expr):
+        parts = expr.split(); assert len(parts)==5
+        self.minute,self.hour,self.dom,self.month,self.dow = [self._parse(p) for p in parts]
+    def _parse(self, field):
+        if field == '*': return None
+        if '/' in field: base, step = field.split('/'); return ('step', int(step))
+        if ',' in field: return ('list', [int(x) for x in field.split(',')])
+        if '-' in field: lo, hi = field.split('-'); return ('range', int(lo), int(hi))
+        return ('exact', int(field))
+    def describe(self):
+        def desc(f, name):
+            if f is None: return f"every {name}"
+            if f[0] == 'exact': return f"at {name} {f[1]}"
+            if f[0] == 'step': return f"every {f[1]} {name}s"
+            if f[0] == 'list': return f"at {name}s {f[1]}"
+            if f[0] == 'range': return f"{name} {f[1]}-{f[2]}"
+        return ", ".join(filter(None, [desc(self.minute,"min"),desc(self.hour,"hour")]))
 
 class Task:
-    __slots__ = ('id', 'priority', 'fn', 'args', 'result', 'created', 'started', 'finished')
-    _counter = 0
-    def __init__(self, fn, args=(), priority=0):
-        Task._counter += 1
-        self.id = Task._counter
-        self.priority = priority
-        self.fn = fn
-        self.args = args
-        self.result = None
-        self.created = time.time()
-        self.started = None
-        self.finished = None
-    def __lt__(self, other):
-        return self.priority < other.priority
+    def __init__(self, name, fn, deps=None, priority=0, retries=3):
+        self.name,self.fn,self.deps = name,fn,deps or []
+        self.priority,self.retries,self.attempts = priority,retries,0
+        self.state = "pending"; self.result = None
+    def __lt__(self, other): return self.priority > other.priority
+
+class DAGScheduler:
+    def __init__(self): self.tasks = {}; self.completed = set()
+    def add(self, task): self.tasks[task.name] = task
+    def _ready(self):
+        return [t for t in self.tasks.values() if t.state=="pending" and all(d in self.completed for d in t.deps)]
     def run(self):
-        self.started = time.time()
-        self.result = self.fn(*self.args)
-        self.finished = time.time()
-        return self.result
-    @property
-    def latency(self):
-        return (self.finished - self.created) * 1000 if self.finished else None
-
-class FIFOScheduler:
-    def __init__(self):
-        self.queue = deque()
-    def submit(self, task):
-        self.queue.append(task)
-    def run_all(self):
-        results = []
-        while self.queue:
-            task = self.queue.popleft()
-            task.run()
-            results.append(task)
-        return results
-
-class PriorityScheduler:
-    def __init__(self):
-        self.heap = []
-    def submit(self, task):
-        heapq.heappush(self.heap, task)
-    def run_all(self):
-        results = []
-        while self.heap:
-            task = heapq.heappop(self.heap)
-            task.run()
-            results.append(task)
-        return results
-
-class RoundRobinScheduler:
-    def __init__(self, num_queues=4):
-        self.queues = [deque() for _ in range(num_queues)]
-        self.next_queue = 0
-    def submit(self, task):
-        self.queues[self.next_queue].append(task)
-        self.next_queue = (self.next_queue + 1) % len(self.queues)
-    def run_all(self):
-        results = []
-        active = True
-        while active:
-            active = False
-            for q in self.queues:
-                if q:
-                    task = q.popleft()
-                    task.run()
-                    results.append(task)
-                    active = True
-        return results
-
-class WorkStealingScheduler:
-    """Cilk-style work-stealing with per-worker deques."""
-    def __init__(self, num_workers=4):
-        self.num_workers = num_workers
-        self.deques = [deque() for _ in range(num_workers)]
-        self.next = 0
-
-    def submit(self, task):
-        self.deques[self.next].append(task)
-        self.next = (self.next + 1) % self.num_workers
-
-    def run_all(self):
-        results = []
-        for worker_id in range(self.num_workers):
-            while True:
-                # Try own deque (LIFO for locality)
-                if self.deques[worker_id]:
-                    task = self.deques[worker_id].pop()
-                else:
-                    # Steal from others (FIFO)
-                    task = None
-                    for i in range(self.num_workers):
-                        if i != worker_id and self.deques[i]:
-                            task = self.deques[i].popleft()
-                            break
-                if task is None:
-                    break
-                task.run()
-                results.append(task)
-        return results
-
-class TokenBucket:
-    """Rate limiter using token bucket algorithm."""
-    def __init__(self, rate, burst):
-        self.rate = rate      # tokens per second
-        self.burst = burst    # max tokens
-        self.tokens = burst
-        self.last = time.time()
-
-    def acquire(self, n=1):
-        now = time.time()
-        self.tokens = min(self.burst, self.tokens + (now - self.last) * self.rate)
-        self.last = now
-        if self.tokens >= n:
-            self.tokens -= n
-            return True
-        return False
+        log = []
+        while True:
+            ready = self._ready()
+            if not ready: break
+            ready.sort()
+            for task in ready:
+                task.attempts += 1
+                try:
+                    task.result = task.fn(); task.state = "done"
+                    self.completed.add(task.name)
+                    log.append(f"OK: {task.name} -> {task.result}")
+                except Exception as e:
+                    if task.attempts >= task.retries:
+                        task.state = "failed"; log.append(f"FAIL: {task.name} ({e})")
+                    else: log.append(f"RETRY: {task.name} ({task.attempts}/{task.retries})")
+        return log
 
 def main():
-    random.seed(42)
-    work = lambda x: x * x
+    cron = CronExpr("*/5 9-17 * * 1-5")
+    print(f"  Cron: {cron.describe()}")
+    dag = DAGScheduler()
+    dag.add(Task("fetch", lambda: "data_ok"))
+    dag.add(Task("parse", lambda: "parsed", deps=["fetch"]))
+    dag.add(Task("validate", lambda: "valid", deps=["parse"]))
+    dag.add(Task("transform", lambda: "transformed", deps=["validate"]))
+    dag.add(Task("load", lambda: "loaded", deps=["transform"]))
+    log = dag.run()
+    for entry in log: print(f"  {entry}")
 
-    print("=== Task Scheduler Comparison ===\n")
-    for name, sched_cls in [("FIFO", FIFOScheduler), ("Priority", PriorityScheduler),
-                             ("RoundRobin", lambda: RoundRobinScheduler(4)),
-                             ("WorkStealing", lambda: WorkStealingScheduler(4))]:
-        sched = sched_cls() if callable(sched_cls) else sched_cls()
-        for i in range(20):
-            sched.submit(Task(work, (i,), priority=random.randint(0, 10)))
-        results = sched.run_all()
-        order = [r.result for r in results[:5]]
-        print(f"  {name:14s}: {len(results)} tasks, first 5 results: {order}")
-
-    print("\n=== Token Bucket Rate Limiter ===")
-    tb = TokenBucket(rate=10, burst=5)
-    accepted = rejected = 0
-    for _ in range(20):
-        if tb.acquire():
-            accepted += 1
-        else:
-            rejected += 1
-    print(f"  20 requests, rate=10/s, burst=5: accepted={accepted}, rejected={rejected}")
-
-if __name__ == "__main__":
-    main()
+if __name__ == "__main__": main()
